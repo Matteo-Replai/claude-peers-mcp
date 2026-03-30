@@ -160,6 +160,12 @@ function readPersistentName(cwd: string): string | null {
   }
 }
 
+function atomicWriteJson(filePath: string, data: unknown) {
+  const tmpFile = filePath + ".tmp." + process.pid;
+  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpFile, filePath);
+}
+
 function writePersistentName(cwd: string, name: string) {
   try {
     let data: Record<string, { name: string; updated: number }> = {};
@@ -172,7 +178,7 @@ function writePersistentName(cwd: string, name: string) {
     }
     const key = normalizePath(cwd);
     data[key] = { name, updated: Date.now() };
-    fs.writeFileSync(PERSISTENT_NAMES_FILE, JSON.stringify(data, null, 2));
+    atomicWriteJson(PERSISTENT_NAMES_FILE, data);
     log(`Persistent name saved: ${key} -> ${name}`);
   } catch (e) {
     log(`Persistent name write failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
@@ -195,7 +201,7 @@ function writePeerNameBridge(cwd: string, name: string, peerId: string) {
     }
     const key = normalizePath(cwd);
     data[key] = { name, peer_id: peerId, pid: process.pid, updated: Date.now() };
-    fs.writeFileSync(PEER_NAME_BRIDGE, JSON.stringify(data, null, 2));
+    atomicWriteJson(PEER_NAME_BRIDGE, data);
     log(`Peer name bridge updated: ${key} -> ${name}`);
   } catch (e) {
     log(`Peer name bridge write failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);

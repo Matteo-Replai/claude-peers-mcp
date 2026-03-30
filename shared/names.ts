@@ -30,9 +30,14 @@ export function pickName(takenNames: string[]): string {
   const available = NAMES.filter((n) => !taken.has(n.toLowerCase()));
 
   if (available.length === 0) {
-    // All names taken — append a number to a random one
+    // All names taken — append a number, loop until unique
     const base = NAMES[Math.floor(Math.random() * NAMES.length)];
-    return `${base}-${Math.floor(Math.random() * 99) + 2}`;
+    for (let i = 2; i < 1000; i++) {
+      const candidate = `${base}-${i}`;
+      if (!taken.has(candidate.toLowerCase())) return candidate;
+    }
+    // Extreme fallback
+    return `${base}-${Date.now() % 10000}`;
   }
 
   return available[Math.floor(Math.random() * available.length)];

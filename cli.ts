@@ -45,6 +45,7 @@ switch (cmd) {
         const peers = await brokerFetch<
           Array<{
             id: string;
+            name: string;
             pid: number;
             cwd: string;
             git_root: string | null;

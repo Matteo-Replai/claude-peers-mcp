@@ -159,11 +159,14 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  // Pick a unique Italian name
-  const takenNames = (db.query("SELECT name FROM peers").all() as { name: string }[]).map((r) => r.name);
-  const name = pickName(takenNames);
-
-  insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  // Pick a unique name and insert atomically to prevent race conditions
+  const registerTx = db.transaction(() => {
+    const takenNames = (db.query("SELECT name FROM peers").all() as { name: string }[]).map((r) => r.name);
+    const name = pickName(takenNames);
+    insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+    return name;
+  });
+  const name = registerTx();
   return { id, name };
 }
 
@@ -237,8 +240,12 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
-function handleSetName(body: SetNameRequest): void {
-  updateName.run(body.name, body.id);
+function handleSetName(body: SetNameRequest): { ok: boolean; error?: string } {
+  const result = updateName.run(body.name, body.id);
+  if (result.changes === 0) {
+    return { ok: false, error: `Peer ${body.id} not found` };
+  }
+  return { ok: true };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -274,8 +281,7 @@ Bun.serve({
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
         case "/set-name":
-          handleSetName(body as SetNameRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleSetName(body as SetNameRequest));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
