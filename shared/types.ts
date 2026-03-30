@@ -3,6 +3,7 @@ export type PeerId = string;
 
 export interface Peer {
   id: PeerId;
+  name: string;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -33,6 +34,12 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  name: string;
+}
+
+export interface SetNameRequest {
+  id: PeerId;
+  name: string;
 }
 
 export interface HeartbeatRequest {

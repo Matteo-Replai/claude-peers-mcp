@@ -15,6 +15,7 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetNameRequest,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
@@ -22,6 +23,7 @@ import type {
   Peer,
   Message,
 } from "./shared/types.ts";
+import { pickName } from "./shared/names.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -35,6 +37,7 @@ db.run("PRAGMA busy_timeout = 3000");
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
     pid INTEGER NOT NULL,
     cwd TEXT NOT NULL,
     git_root TEXT,
@@ -44,6 +47,13 @@ db.run(`
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migration: add name column if missing (existing DBs)
+try {
+  db.run("ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''");
+} catch {
+  // Column already exists
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -81,8 +91,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -91,6 +101,10 @@ const updateLastSeen = db.prepare(`
 
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
+`);
+
+const updateName = db.prepare(`
+  UPDATE peers SET name = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -145,8 +159,12 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
+  // Pick a unique Italian name
+  const takenNames = (db.query("SELECT name FROM peers").all() as { name: string }[]).map((r) => r.name);
+  const name = pickName(takenNames);
+
+  insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  return { id, name };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -219,6 +237,10 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+function handleSetName(body: SetNameRequest): void {
+  updateName.run(body.name, body.id);
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -250,6 +272,9 @@ Bun.serve({
           return Response.json({ ok: true });
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
+          return Response.json({ ok: true });
+        case "/set-name":
+          handleSetName(body as SetNameRequest);
           return Response.json({ ok: true });
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
