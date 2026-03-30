@@ -19,6 +19,9 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as nodePath from "node:path";
 import type {
   PeerId,
   Peer,
@@ -133,9 +136,76 @@ function getTty(): string | null {
   return null;
 }
 
+// --- Path normalization ---
+
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+// --- Persistent peer names (survives broker restarts) ---
+
+const PERSISTENT_NAMES_FILE = nodePath.join(
+  process.env.HOME || process.env.USERPROFILE || os.homedir(),
+  ".claude-peers-names.json"
+);
+
+function readPersistentName(cwd: string): string | null {
+  try {
+    if (!fs.existsSync(PERSISTENT_NAMES_FILE)) return null;
+    const data = JSON.parse(fs.readFileSync(PERSISTENT_NAMES_FILE, "utf8"));
+    const key = normalizePath(cwd);
+    return data[key]?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistentName(cwd: string, name: string) {
+  try {
+    let data: Record<string, { name: string; updated: number }> = {};
+    if (fs.existsSync(PERSISTENT_NAMES_FILE)) {
+      try {
+        data = JSON.parse(fs.readFileSync(PERSISTENT_NAMES_FILE, "utf8"));
+      } catch {
+        // Corrupted, start fresh
+      }
+    }
+    const key = normalizePath(cwd);
+    data[key] = { name, updated: Date.now() };
+    fs.writeFileSync(PERSISTENT_NAMES_FILE, JSON.stringify(data, null, 2));
+    log(`Persistent name saved: ${key} -> ${name}`);
+  } catch (e) {
+    log(`Persistent name write failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// --- Peer name bridge (for statusline) ---
+
+const PEER_NAME_BRIDGE = nodePath.join(os.tmpdir(), "claude-peer-names.json");
+
+function writePeerNameBridge(cwd: string, name: string, peerId: string) {
+  try {
+    let data: Record<string, { name: string; peer_id: string; pid: number; updated: number }> = {};
+    if (fs.existsSync(PEER_NAME_BRIDGE)) {
+      try {
+        data = JSON.parse(fs.readFileSync(PEER_NAME_BRIDGE, "utf8"));
+      } catch {
+        // Corrupted file, start fresh
+      }
+    }
+    const key = normalizePath(cwd);
+    data[key] = { name, peer_id: peerId, pid: process.pid, updated: Date.now() };
+    fs.writeFileSync(PEER_NAME_BRIDGE, JSON.stringify(data, null, 2));
+    log(`Peer name bridge updated: ${key} -> ${name}`);
+  } catch (e) {
+    log(`Peer name bridge write failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
+let myName: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -148,15 +218,16 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages. Each instance is auto-assigned an Italian name for easy identification.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+Read the from_id, from_name, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id. Use from_name to address them by name.
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
 - send_message: Send a message to another instance by ID
+- set_name: Change your display name (overrides the auto-assigned one)
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
 
@@ -219,6 +290,21 @@ const TOOLS = [
     },
   },
   {
+    name: "set_name",
+    description:
+      "Set a custom name for this instance (overrides the auto-assigned Italian name). This name is visible to other peers.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string" as const,
+          description: "The name for this instance (e.g. 'Pippo', 'Claudio')",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
@@ -261,8 +347,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const lines = peers.map((p) => {
+          const label = p.name ? `${p.name} (${p.id})` : p.id;
           const parts = [
-            `ID: ${p.id}`,
+            `Name: ${label}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -356,6 +443,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "set_name": {
+      const { name } = args as { name: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        await brokerFetch("/set-name", { id: myId, name });
+        myName = name;
+        writePeerNameBridge(myCwd, name, myId);
+        writePersistentName(myCwd, name);
+        return {
+          content: [{ type: "text" as const, text: `Name updated: "${name}"` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting name: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     case "check_messages": {
       if (!myId) {
         return {
@@ -409,6 +525,7 @@ async function pollAndPushMessages() {
 
     for (const msg of result.messages) {
       // Look up the sender's info for context
+      let fromName = "";
       let fromSummary = "";
       let fromCwd = "";
       try {
@@ -419,6 +536,7 @@ async function pollAndPushMessages() {
         });
         const sender = peers.find((p) => p.id === msg.from_id);
         if (sender) {
+          fromName = sender.name;
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
         }
@@ -433,6 +551,7 @@ async function pollAndPushMessages() {
           content: msg.text,
           meta: {
             from_id: msg.from_id,
+            from_name: fromName,
             from_summary: fromSummary,
             from_cwd: fromCwd,
             sent_at: msg.sent_at,
@@ -496,7 +615,23 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  myName = reg.name;
+  log(`Registered as peer ${myId} (name: ${myName})`);
+
+  // Restore persistent name if one was previously set for this CWD
+  const persistedName = readPersistentName(myCwd);
+  if (persistedName && persistedName !== myName) {
+    try {
+      await brokerFetch("/set-name", { id: myId, name: persistedName });
+      myName = persistedName;
+      log(`Restored persistent name: ${persistedName}`);
+    } catch (e) {
+      log(`Failed to restore persistent name (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Write peer name to bridge file so the statusline script can display it
+  writePeerNameBridge(myCwd, myName, myId);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -534,6 +669,17 @@ async function main() {
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    // Remove peer name from bridge file
+    try {
+      if (fs.existsSync(PEER_NAME_BRIDGE)) {
+        const data = JSON.parse(fs.readFileSync(PEER_NAME_BRIDGE, "utf8"));
+        const key = normalizePath(myCwd);
+        delete data[key];
+        fs.writeFileSync(PEER_NAME_BRIDGE, JSON.stringify(data, null, 2));
+      }
+    } catch {
+      // Best effort
+    }
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
