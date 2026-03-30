@@ -20,6 +20,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -230,14 +231,22 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // Return undelivered messages WITHOUT marking them delivered.
+  // Caller must explicitly ACK via /ack-messages after successful processing.
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
+  let acked = 0;
+  const ackTx = db.transaction(() => {
+    for (const msgId of body.message_ids) {
+      const result = markDelivered.run(msgId);
+      acked += result.changes;
+    }
+  });
+  ackTx();
+  return { ok: true, acked };
 }
 
 function handleSetName(body: SetNameRequest): { ok: boolean; error?: string } {
@@ -288,6 +297,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

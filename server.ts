@@ -208,6 +208,52 @@ function writePeerNameBridge(cwd: string, name: string, peerId: string) {
   }
 }
 
+// --- File-based inbox (durable buffer for missed channel pushes) ---
+
+function getInboxDir(): string {
+  return nodePath.join(myCwd, ".claudia", "inbox");
+}
+
+function writeInboxFile(msg: Message, sender?: Peer | null) {
+  try {
+    const inboxDir = getInboxDir();
+    fs.mkdirSync(inboxDir, { recursive: true });
+    const filePath = nodePath.join(inboxDir, `${msg.id}.json`);
+    if (fs.existsSync(filePath)) return; // Already written (dedup)
+    const data = {
+      broker_message_id: msg.id,
+      from_id: msg.from_id,
+      from_name: sender?.name ?? "",
+      from_cwd: sender?.cwd ?? "",
+      text: msg.text,
+      sent_at: msg.sent_at,
+      received_at: new Date().toISOString(),
+      processed: false,
+    };
+    atomicWriteJson(filePath, data);
+    log(`Inbox file written: ${filePath}`);
+  } catch (e) {
+    log(`Inbox write failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function scanInboxFiles(): Array<{ broker_message_id: number; from_id: string; from_name: string; text: string; sent_at: string; processed: boolean }> {
+  try {
+    const inboxDir = getInboxDir();
+    if (!fs.existsSync(inboxDir)) return [];
+    const files = fs.readdirSync(inboxDir).filter((f: string) => f.endsWith(".json"));
+    return files.map((f: string) => {
+      try {
+        return JSON.parse(fs.readFileSync(nodePath.join(inboxDir, f), "utf8"));
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -486,20 +532,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // Check broker for undelivered messages
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+
+        // Also scan file inbox for unprocessed messages
+        const inboxFiles = scanInboxFiles().filter((f) => !f.processed);
+
+        const brokerLines = result.messages.map(
+          (m) => `[broker] From ${m.from_id} (${m.sent_at}):\n${m.text}`
+        );
+        const inboxLines = inboxFiles.map(
+          (f) => `[inbox] From ${f.from_name || f.from_id} (${f.sent_at}):\n${f.text}`
+        );
+        const allLines = [...brokerLines, ...inboxLines];
+
+        if (allLines.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${allLines.length} message(s) (${brokerLines.length} broker, ${inboxLines.length} inbox):\n\n${allLines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -523,53 +580,78 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
+// Exponential backoff state for broker connectivity
+let pollBackoffMs = POLL_INTERVAL_MS;
+const MAX_BACKOFF_MS = 30_000;
+
 async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromName = "";
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromName = sender.name;
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
+    // Reset backoff on successful poll
+    pollBackoffMs = POLL_INTERVAL_MS;
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_name: fromName,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
+    if (result.messages.length === 0) return;
+
+    // Cache sender info for this batch (avoid repeated lookups)
+    let peerCache: Peer[] = [];
+    try {
+      peerCache = await brokerFetch<Peer[]>("/list-peers", {
+        scope: "machine",
+        cwd: myCwd,
+        git_root: myGitRoot,
       });
+    } catch {
+      // Non-critical
+    }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    const ackedIds: number[] = [];
+
+    for (const msg of result.messages) {
+      const sender = peerCache.find((p) => p.id === msg.from_id);
+
+      // Write to file inbox (durable buffer)
+      writeInboxFile(msg, sender);
+
+      // Attempt channel push
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_name: sender?.name ?? "",
+              from_summary: sender?.summary ?? "",
+              from_cwd: sender?.cwd ?? "",
+              sent_at: msg.sent_at,
+            },
+          },
+        });
+        ackedIds.push(msg.id);
+        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } catch (e) {
+        log(`Channel push failed for msg ${msg.id}: ${e instanceof Error ? e.message : String(e)}`);
+        // Don't ACK — will retry on next poll
+      }
+    }
+
+    // ACK only successfully pushed messages
+    if (ackedIds.length > 0) {
+      try {
+        await brokerFetch("/ack-messages", { id: myId, message_ids: ackedIds });
+        log(`ACKed ${ackedIds.length} message(s)`);
+      } catch (e) {
+        log(`ACK failed (messages will be re-delivered): ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
+    // Broker unreachable — apply exponential backoff
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    pollBackoffMs = Math.min(pollBackoffMs * 2, MAX_BACKOFF_MS);
+    log(`Backoff: next poll in ${pollBackoffMs}ms`);
   }
 }
 
@@ -657,8 +739,15 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 6. Start polling for inbound messages (with dynamic backoff)
+  let pollTimer: ReturnType<typeof setTimeout>;
+  const schedulePoll = () => {
+    pollTimer = setTimeout(async () => {
+      await pollAndPushMessages();
+      schedulePoll();
+    }, pollBackoffMs);
+  };
+  schedulePoll();
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
@@ -673,7 +762,7 @@ async function main() {
 
   // 8. Clean up on exit
   const cleanup = async () => {
-    clearInterval(pollTimer);
+    clearTimeout(pollTimer);
     clearInterval(heartbeatTimer);
     // Remove peer name from bridge file
     try {
